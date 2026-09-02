@@ -1,0 +1,1778 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Reels Studio</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<style>html,body,#root{margin:0;padding:0;min-height:100%;background:#12151A;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect } = React;
+
+
+/* ---------------------------------------------------------
+   ДИЗАЙН-ТОКЕНЫ
+--------------------------------------------------------- */
+const THEME = {
+  bg: "#12151A",
+  panel: "#1A1E26",
+  panel2: "#20252F",
+  line: "#2C3240",
+  text: "#EDEBE3",
+  textDim: "#8B93A3",
+  amber: "#E8A33D",
+  coral: "#E7654F",
+  teal: "#4FBF8B",
+};
+
+// один общий столбик правок (пробный месяц без разделения на типы)
+const STAGES = [
+  { key: "to_edit", label: "На монтаж" },
+  { key: "in_progress", label: "В работе" },
+  { key: "for_review", label: "На согласование" },
+  { key: "revision", label: "Правки" },
+  { key: "to_send", label: "На отправку клиенту" },
+  { key: "with_client", label: "У заказчика" },
+];
+const STAGE_ORDER = STAGES.map(s => s.key);
+const PAY_STAGE = "for_review";
+
+// если у монтажёра 4+ карточки одновременно в "Правках" — новые ролики
+// брать нельзя, пока не разберёт часть правок. Разбор правок и сдача
+// на согласование всегда разрешены.
+const REVISION_BACKLOG_LIMIT = 4;
+
+/* ---------------------------------------------------------
+   ГРЕЙДЫ — владелец задаёт ставку за ролик по каждому грейду.
+   Оплата идёт чисто по грейду, без штрафов и бонусов.
+--------------------------------------------------------- */
+const defaultGrades = [
+  { level: 1, rate: 300 },
+  { level: 2, rate: 350 },
+  { level: 3, rate: 400 },
+  { level: 4, rate: 450 },
+  { level: 5, rate: 500 },
+];
+
+// доплата, если монтажёр отмечает, что ролик длиннее двух минут
+const DEFAULT_LONG_VIDEO_BONUS = 600;
+
+// сложность клиента даёт баллы — пока чисто для наблюдения, на оплату
+// не влияет. Бонусную систему за баллы решим через месяц по факту.
+const complexityMap = {
+  easy: { label: "Лёгкий", points: 1 },
+  medium: { label: "Средний", points: 2 },
+  hard: { label: "Сложный", points: 3 },
+};
+
+function rateForGrade(gradeLevel, grades) {
+  return grades.find(g => g.level === gradeLevel)?.rate ?? 0;
+}
+
+function complexityPoints(clientId, clients) {
+  const c = clients.find(x => x.id === clientId);
+  return c ? complexityMap[c.complexity].points : 0;
+}
+
+/* ---------------------------------------------------------
+   ЛЮДИ / МОНТАЖЁРЫ / КЛИЕНТЫ
+--------------------------------------------------------- */
+let nextMonteurId = 5;
+let nextClientId = 6;
+let nextTaskId = 100;
+const initialMonteurs = [
+  { id: 1, name: "Аня Соколова", gradeLevel: 3 },
+  { id: 2, name: "Игорь Панов", gradeLevel: 2 },
+  { id: 3, name: "Марина Лис", gradeLevel: 4 },
+  { id: 4, name: "Дмитрий Орлов", gradeLevel: 1 },
+];
+
+// общая база клиентов — видят владелец и проджект, монтажёры не видят.
+const initialClients = [
+  { id: 1, name: "FitLab", complexity: "easy", active: true },
+  { id: 2, name: "Nomad Coffee", complexity: "medium", active: true },
+  { id: 3, name: "GlowSkin", complexity: "easy", active: true },
+  { id: 4, name: "TechReview RU", complexity: "hard", active: true },
+  { id: 5, name: "Sunny Kids", complexity: "medium", active: true },
+];
+
+// владелец и проджект — фиксированные роли, не привязаны к таблице monteurs
+const STATIC_PEOPLE = [
+  { id: "owner", name: "Владелец", role: "owner", title: "Владелец" },
+  { id: "pm", name: "Проджект менеджер", role: "pm", title: "Проджект" },
+];
+
+// монтажёров для входа собираем из актуального списка в базе —
+// сколько бы их ни было, а не только первые 4, как раньше.
+function buildPeople(monteurs) {
+  return [
+    ...STATIC_PEOPLE,
+    ...monteurs.map(m => ({ id: `m${m.id}`, name: m.name, role: "editor", title: "Монтажёр", monteurId: m.id })),
+  ];
+}
+
+const NAV_BY_ROLE = {
+  owner: [
+    { key: "board", label: "Доска" },
+    { key: "clients", label: "Клиенты и сложность" },
+    { key: "monteurs", label: "Монтажёры и грейды" },
+    { key: "editorCabinets", label: "Кабинеты монтажёров" },
+    { key: "stats", label: "Статистика" },
+  ],
+  pm: [
+    { key: "board", label: "Доска" },
+    { key: "clients", label: "Клиенты и сложность" },
+    { key: "editorCabinets", label: "Кабинеты монтажёров" },
+    { key: "stats", label: "Статистика" },
+  ],
+  editor: [
+    { key: "board", label: "Моя доска" },
+    { key: "cabinet", label: "Личный кабинет" },
+  ],
+};
+
+/* ---------------------------------------------------------
+   МОК-ДАННЫЕ КАРТОЧЕК
+--------------------------------------------------------- */
+function buildStageLog(currentStatus, daysAgo) {
+  const idx = STAGE_ORDER.indexOf(currentStatus);
+  const now = Date.now();
+  const span = daysAgo * 24 * 3600 * 1000;
+  const perStage = span / (idx + 1);
+  let t = now - span;
+  const log = [];
+  for (let i = 0; i <= idx; i++) {
+    const entered = t;
+    const exited = i === idx ? null : t + perStage;
+    log.push({ stage: STAGE_ORDER[i], enteredAt: entered, exitedAt: exited });
+    t += perStage;
+  }
+  return log;
+}
+
+function seedTasks() {
+  const plan = [
+    // monteurId, clientId, status, daysAgoStarted
+    [1, 1, "with_client", 6], [1, 2, "for_review", 2], [1, 3, "to_send", 4], [1, 4, "in_progress", 1], [1, 5, "revision", 3],
+    [2, 2, "to_edit", 0], [2, 4, "with_client", 5], [2, 1, "for_review", 1], [2, 5, "revision", 2], [2, 3, "revision", 2], [2, 4, "revision", 1], [2, 1, "revision", 1], [2, 2, "revision", 1],
+    [3, 3, "with_client", 7], [3, 5, "to_send", 4], [3, 2, "for_review", 2], [3, 1, "in_progress", 1], [3, 4, "revision", 3],
+    [4, 4, "to_edit", 0], [4, 3, "in_progress", 1],
+  ];
+  let id = 1;
+  const rows = plan.map(([monteurId, clientId, status, daysAgo]) => {
+    const stageLog = buildStageLog(status, Math.max(daysAgo, 0.3));
+    const passedReview = STAGE_ORDER.indexOf(status) >= STAGE_ORDER.indexOf(PAY_STAGE);
+    const reviewEntry = stageLog.find(e => e.stage === PAY_STAGE);
+    const monteur = initialMonteurs.find(m => m.id === monteurId);
+    const client = initialClients.find(c => c.id === clientId);
+    const paid = passedReview;
+    const paidAmount = paid ? rateForGrade(monteur.gradeLevel, defaultGrades) : 0;
+    const paidAt = paid ? reviewEntry?.enteredAt ?? Date.now() : null;
+    return {
+      id: id++,
+      title: `${client.name} ${Math.ceil(Math.random() * 9)}`,
+      clientId,
+      monteurId,
+      status,
+      stageLog,
+      paid,
+      paidAmount,
+      paidAt,
+      longVideo: false,
+      chat: seedChat(monteurId, status),
+    };
+  });
+  // пара нераспределённых ТЗ в очереди
+  const queuePlan = [3, 5];
+  queuePlan.forEach(clientId => {
+    const client = initialClients.find(c => c.id === clientId);
+    rows.push({
+      id: id++, title: `${client.name} — новое ТЗ`, clientId, monteurId: null, status: "to_edit",
+      stageLog: [{ stage: "to_edit", enteredAt: Date.now() - 3600_000 * 6, exitedAt: null }],
+      paid: false, paidAmount: 0, paidAt: null, longVideo: false, chat: [],
+    });
+  });
+  nextTaskId = id;
+  return rows;
+}
+
+function seedChat(monteurId, status) {
+  const authorName = PEOPLE.find(p => p.monteurId === monteurId)?.name;
+  if (status === "revision") return [{ id: 1, authorId: "pm", authorName: "Настя Волкова", text: "Есть пара моментов на доработку, посмотри пожалуйста.", ts: Date.now() - 3600_000 * 3 }];
+  if (status === "for_review") return [{ id: 1, authorId: `m${monteurId}`, authorName, text: "Готово, отправил на согласование.", ts: Date.now() - 3600_000 * 2 }];
+  return [];
+}
+
+// фиксируем факт правки для статистики (без денег и без влияния на баллы)
+function seedRevisions(tasks) {
+  let id = 1;
+  return tasks.filter(t => t.status === "revision").map(t => ({ id: id++, taskId: t.id, monteurId: t.monteurId, ts: Date.now() - 3600_000 * 3 }));
+}
+
+// архивные оплаченные ролики за два предыдущих месяца — чтобы в
+// «Статистике» было что смотреть при переключении месяца.
+function seedHistoricalTasks() {
+  const now = new Date();
+  const countsByMonteur = { 1: [11, 9], 2: [5, 7], 3: [16, 13], 4: [4, 2] }; // [месяц назад, 2 месяца назад]
+  const rows = [];
+  Object.entries(countsByMonteur).forEach(([monteurIdStr, counts]) => {
+    const monteurId = Number(monteurIdStr);
+    const monteur = initialMonteurs.find(m => m.id === monteurId);
+    counts.forEach((count, idx) => {
+      const monthsAgo = idx + 1;
+      for (let i = 0; i < count; i++) {
+        const client = initialClients[Math.floor(Math.random() * initialClients.length)];
+        const day = 1 + Math.floor(Math.random() * 26);
+        const paidAt = new Date(now.getFullYear(), now.getMonth() - monthsAgo, day, 9 + Math.floor(Math.random() * 9)).getTime();
+        const longVideo = Math.random() < 0.12;
+        const paidAmount = rateForGrade(monteur.gradeLevel, defaultGrades);
+        rows.push({
+          id: nextTaskId++,
+          title: `${client.name} — архив ${i + 1}`,
+          clientId: client.id, monteurId, status: "with_client",
+          stageLog: [{ stage: "with_client", enteredAt: paidAt, exitedAt: null }],
+          paid: true, paidAmount, paidAt, longVideo, chat: [],
+        });
+      }
+    });
+  });
+  return rows;
+}
+
+/* ---------------------------------------------------------
+   УТИЛИТЫ
+--------------------------------------------------------- */
+function fmt(n) {
+  return Math.round(n).toLocaleString("ru-RU");
+}
+
+// превращает ссылки в тексте сообщения в кликабельные — без dangerouslySetInnerHTML,
+// просто разбиваем строку на кусочки текста и ссылок.
+const URL_RE = /(https?:\/\/[^\s]+)/g;
+function linkifyText(text) {
+  // split() с "захватывающей" группой кладёт сами ссылки на нечётные индексы,
+  // а обычный текст — на чётные. Так надёжнее, чем повторно гонять regex.test().
+  const parts = text.split(URL_RE);
+  return parts.map((part, i) =>
+    i % 2 === 1 ? (
+      <a key={i} href={part} target="_blank" rel="noopener noreferrer" style={{ color: THEME.amber, wordBreak: "break-all" }}>{part}</a>
+    ) : part ? (
+      <React.Fragment key={i}>{part}</React.Fragment>
+    ) : null
+  );
+}
+
+function formatDuration(ms) {
+  if (ms <= 0) return "—";
+  const totalMin = Math.floor(ms / 60000);
+  const days = Math.floor(totalMin / 1440);
+  const hours = Math.floor((totalMin % 1440) / 60);
+  const mins = totalMin % 60;
+  const parts = [];
+  if (days) parts.push(`${days}д`);
+  if (hours) parts.push(`${hours}ч`);
+  if (!days && mins) parts.push(`${mins}м`);
+  return parts.join(" ") || "0м";
+}
+
+function stageDurations(stageLog) {
+  const now = Date.now();
+  const totals = {};
+  stageLog.forEach(e => {
+    const dur = (e.exitedAt || now) - e.enteredAt;
+    totals[e.stage] = (totals[e.stage] || 0) + dur;
+  });
+  return totals;
+}
+
+function isSameMonth(ts, ref = new Date()) {
+  const d = new Date(ts);
+  return d.getMonth() === ref.getMonth() && d.getFullYear() === ref.getFullYear();
+}
+
+// месячная статистика монтажёра: деньги строго по грейду (или фикс. ставка
+// за длинный ролик) + баллы для наблюдения. refDate задаёт, за какой месяц
+// считаем — по умолчанию текущий.
+function monthlyStats(monteurId, tasks, revisions, clients, grades, monteurs, longVideoBonus, refDate = new Date()) {
+  const m = monteurs.find(x => x.id === monteurId);
+  const rate = rateForGrade(m.gradeLevel, grades);
+  const paidThisMonth = tasks.filter(t => t.monteurId === monteurId && t.paid && isSameMonth(t.paidAt, refDate));
+  const moneySum = paidThisMonth.reduce((s, t) => s + (t.longVideo ? longVideoBonus : t.paidAmount), 0);
+  const points = paidThisMonth.reduce((s, t) => s + complexityPoints(t.clientId, clients), 0);
+  const byComplexity = { easy: 0, medium: 0, hard: 0 };
+  paidThisMonth.forEach(t => {
+    const c = clients.find(x => x.id === t.clientId);
+    if (c) byComplexity[c.complexity]++;
+  });
+  const count = paidThisMonth.length;
+  const pct = {
+    easy: count ? Math.round((byComplexity.easy / count) * 100) : 0,
+    medium: count ? Math.round((byComplexity.medium / count) * 100) : 0,
+    hard: count ? Math.round((byComplexity.hard / count) * 100) : 0,
+  };
+  const revisionsThisMonth = revisions.filter(r => r.monteurId === monteurId && isSameMonth(r.ts, refDate)).length;
+  const revisionsNow = tasks.filter(t => t.monteurId === monteurId && t.status === "revision").length;
+  return { monteur: m, rate, count, moneySum, points, byComplexity, pct, revisionsThisMonth, revisionsNow };
+}
+
+function lastNMonths(n) {
+  const now = new Date();
+  const months = [];
+  for (let i = 0; i < n; i++) months.push(new Date(now.getFullYear(), now.getMonth() - i, 1));
+  return months;
+}
+
+function monthLabel(d) {
+  return d.toLocaleDateString("ru-RU", { month: "long", year: "numeric" });
+}
+
+function exportCsv(rows, filename, header) {
+  const blob = new Blob([header + "\n" + rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  a.click();
+}
+
+/* ---------------------------------------------------------
+   UI-ПРИМИТИВЫ
+--------------------------------------------------------- */
+function Card({ children, style, ...rest }) {
+  return (
+    <div style={{ background: THEME.panel, border: `1px solid ${THEME.line}`, borderRadius: 14, padding: 16, ...style }} {...rest}>
+      {children}
+    </div>
+  );
+}
+
+function Pill({ children, tone = "dim" }) {
+  const tones = {
+    dim: { bg: "#252B36", color: THEME.textDim },
+    amber: { bg: "#3A2E17", color: THEME.amber },
+    coral: { bg: "#3A1F1A", color: THEME.coral },
+    teal: { bg: "#173328", color: THEME.teal },
+  };
+  const t = tones[tone];
+  return <span style={{ background: t.bg, color: t.color, fontSize: 12, padding: "3px 9px", borderRadius: 999, fontWeight: 600, whiteSpace: "nowrap" }}>{children}</span>;
+}
+
+function Field({ label, children }) {
+  return (
+    <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 12, color: THEME.textDim }}>
+      {label}
+      {children}
+    </label>
+  );
+}
+
+function Stat({ label, value, accent }) {
+  return (
+    <div>
+      <div style={{ fontSize: 11, color: THEME.textDim, marginBottom: 2 }}>{label}</div>
+      <div style={{ fontSize: 17, fontWeight: 700, color: accent ? THEME.amber : THEME.text }}>{value}</div>
+    </div>
+  );
+}
+
+const inputStyle = {
+  background: THEME.panel2,
+  border: `1px solid ${THEME.line}`,
+  borderRadius: 8,
+  padding: "7px 10px",
+  color: THEME.text,
+  fontSize: 13,
+  outline: "none",
+};
+
+/* ---------------------------------------------------------
+   ЭКРАН ВХОДА
+--------------------------------------------------------- */
+// пароль спрашиваем только у владельца и проджекта — у монтажёров вход
+// по клику, как раньше.
+const LOGIN_PASSWORDS = {
+  owner: "владелетс",
+  pm: "иван007",
+};
+
+function LoginScreen({ monteurs, onLogin }) {
+  const [pendingId, setPendingId] = useState(null);
+  const [pwd, setPwd] = useState("");
+  const [error, setError] = useState("");
+  const people = buildPeople(monteurs);
+
+  const handleClick = p => {
+    if (LOGIN_PASSWORDS[p.id]) {
+      setPendingId(p.id);
+      setPwd("");
+      setError("");
+    } else {
+      onLogin(p.id);
+    }
+  };
+
+  const submitPassword = () => {
+    if (pwd === LOGIN_PASSWORDS[pendingId]) {
+      onLogin(pendingId);
+    } else {
+      setError("Неверный пароль");
+      setPwd("");
+    }
+  };
+
+  const pendingPerson = people.find(p => p.id === pendingId);
+
+  return (
+    <div style={{ minHeight: "100vh", background: THEME.bg, color: THEME.text, display: "flex", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ maxWidth: 380, width: "100%" }}>
+        <div style={{ fontSize: 11, letterSpacing: 1.5, color: THEME.textDim, textTransform: "uppercase", marginBottom: 6, textAlign: "center" }}>Reels Studio</div>
+        <h1 style={{ fontSize: 22, fontWeight: 700, textAlign: "center", margin: "0 0 4px" }}>Войти в кабинет</h1>
+
+        {pendingPerson ? (
+          <div style={{ marginTop: 22 }}>
+            <div style={{ fontSize: 13, color: THEME.textDim, textAlign: "center", marginBottom: 14 }}>Пароль для входа как «{pendingPerson.name}»</div>
+            <input
+              type="password"
+              autoFocus
+              value={pwd}
+              onChange={e => { setPwd(e.target.value); setError(""); }}
+              onKeyDown={e => e.key === "Enter" && submitPassword()}
+              placeholder="Пароль"
+              style={{ ...inputStyle, width: "100%", padding: "12px 14px", marginBottom: 10 }}
+            />
+            {error && <div style={{ color: THEME.coral, fontSize: 12, marginBottom: 10, textAlign: "center" }}>{error}</div>}
+            <div style={{ display: "flex", gap: 8 }}>
+              <button onClick={() => setPendingId(null)} style={{ ...inputStyle, cursor: "pointer", flex: 1 }}>Назад</button>
+              <button onClick={submitPassword} style={{ ...inputStyle, cursor: "pointer", flex: 1, background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>Войти</button>
+            </div>
+          </div>
+        ) : (
+          <>
+            <div style={{ fontSize: 13, color: THEME.textDim, textAlign: "center", marginBottom: 22 }}>Выберите себя из списка.</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {people.map(p => (
+                <button key={p.id} onClick={() => handleClick(p)} style={{ ...inputStyle, cursor: "pointer", textAlign: "left", padding: "12px 14px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ fontWeight: 600 }}>{p.name}</span>
+                  <Pill tone={p.role === "owner" ? "amber" : p.role === "pm" ? "teal" : "dim"}>{p.title}</Pill>
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   КАРТОЧКА — модалка с чатом, таймингом и оплатой
+--------------------------------------------------------- */
+function CardModal({ task, monteurs, clients, revisions, person, onClose, onSendMessage, onReassign, onEditTitle, onDeleteCard, onDeleteMessage }) {
+  const [text, setText] = useState("");
+  const [editingTitle, setEditingTitle] = useState(false);
+  const [titleValue, setTitleValue] = useState("");
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [showTimeInfo, setShowTimeInfo] = useState(false);
+  const [mounted, setMounted] = useState(false);
+  const chatEndRef = React.useRef(null);
+
+  useEffect(() => {
+    if (task) { const t = setTimeout(() => setMounted(true), 10); return () => clearTimeout(t); }
+    setMounted(false);
+  }, [task?.id]);
+
+  useEffect(() => {
+    if (chatEndRef.current) chatEndRef.current.scrollIntoView({ block: "nearest" });
+  }, [task?.chat?.length]);
+
+  if (!task) return null;
+  const monteur = monteurs.find(m => m.id === task.monteurId);
+  const client = clients.find(c => c.id === task.clientId);
+  const durations = stageDurations(task.stageLog);
+  const taskRevisions = revisions.filter(r => r.taskId === task.id).slice().sort((a, b) => b.ts - a.ts);
+  const canManage = person.role === "owner" || person.role === "pm";
+
+  const startEditTitle = () => { setTitleValue(task.title); setEditingTitle(true); };
+  const saveTitle = () => {
+    if (titleValue.trim()) onEditTitle(task.id, titleValue.trim());
+    setEditingTitle(false);
+  };
+
+  const handleDeleteCard = () => {
+    onDeleteCard(task.id);
+    onClose();
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50 }}>
+      <div onClick={onClose} style={{ position: "absolute", inset: 0, background: "rgba(0,0,0,.55)", opacity: mounted ? 1 : 0, transition: "opacity .2s ease" }} />
+      <div
+        style={{
+          position: "absolute", top: 0, right: 0, bottom: 0, width: "min(440px, 100vw)",
+          background: THEME.panel2, borderLeft: `1px solid ${THEME.line}`,
+          display: "flex", flexDirection: "column",
+          transform: mounted ? "translateX(0)" : "translateX(100%)", transition: "transform .22s ease",
+          boxShadow: "-8px 0 30px rgba(0,0,0,.4)",
+        }}
+      >
+        {/* закреплённая шапка: название + короткая статистика по карточке */}
+        <div style={{ flexShrink: 0, padding: 16, borderBottom: `1px solid ${THEME.line}` }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8, marginBottom: 8 }}>
+            {editingTitle ? (
+              <div style={{ display: "flex", gap: 6, flex: 1 }}>
+                <input autoFocus value={titleValue} onChange={e => setTitleValue(e.target.value)} onKeyDown={e => e.key === "Enter" && saveTitle()} style={{ ...inputStyle, flex: 1, fontSize: 15, fontWeight: 700 }} />
+                <button onClick={saveTitle} style={{ ...inputStyle, cursor: "pointer", padding: "4px 9px", background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>✓</button>
+                <button onClick={() => setEditingTitle(false)} style={{ ...inputStyle, cursor: "pointer", padding: "4px 9px" }}>✕</button>
+              </div>
+            ) : (
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flex: 1, minWidth: 0 }}>
+                <div style={{ fontWeight: 700, fontSize: 16, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{task.title}</div>
+                {canManage && <button onClick={startEditTitle} style={{ ...inputStyle, cursor: "pointer", padding: "3px 7px", fontSize: 11, flexShrink: 0 }}>изменить</button>}
+              </div>
+            )}
+            <button onClick={onClose} style={{ ...inputStyle, cursor: "pointer", padding: "4px 9px", flexShrink: 0 }}>✕</button>
+          </div>
+
+          <div style={{ fontSize: 11, color: THEME.textDim, marginBottom: 8 }}>{STAGES.find(s => s.key === task.status)?.label}</div>
+
+          <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 8, flexWrap: "wrap" }}>
+            {person.role === "editor" ? (
+              <Pill>{monteur?.name ?? "не назначен"}</Pill>
+            ) : (
+              <select value={task.monteurId ?? "queue"} onChange={e => onReassign(task.id, e.target.value === "queue" ? null : Number(e.target.value))} style={{ ...inputStyle, fontSize: 12 }}>
+                <option value="queue">Очередь (не распределено)</option>
+                {monteurs.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
+            )}
+            {person.role !== "editor" && client && <Pill tone="dim">{client.name} · {complexityMap[client.complexity].label}</Pill>}
+            <Pill tone={taskRevisions.length > 0 ? "coral" : "dim"}>Правок: {taskRevisions.length}</Pill>
+          </div>
+
+          <div style={{ marginBottom: 6 }}>
+            {task.paid ? <Pill tone="teal">оплачено {fmt(task.paidAmount)}₽ · грейд {monteur?.gradeLevel}</Pill> : <Pill tone="amber">не оплачено — спишется при первом попадании на «На согласование»</Pill>}
+          </div>
+
+          <button onClick={() => setShowTimeInfo(v => !v)} style={{ ...inputStyle, cursor: "pointer", fontSize: 11, padding: "3px 8px", marginTop: 4 }}>
+            {showTimeInfo ? "Скрыть время по колонкам" : "Показать время по колонкам"}
+          </button>
+          {showTimeInfo && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 3, marginTop: 8 }}>
+              {STAGES.map(s => (
+                <div key={s.key} style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: s.key === task.status ? THEME.text : THEME.textDim }}>
+                  <span>{s.label}{s.key === task.status ? " (сейчас)" : ""}</span>
+                  <span>{formatDuration(durations[s.key] || 0)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* чат — прокручивается независимо от шапки, в стиле мессенджера */}
+        <div style={{ flex: 1, overflowY: "auto", padding: "14px 14px 6px", display: "flex", flexDirection: "column", gap: 8 }}>
+          {task.chat.length === 0 && <div style={{ fontSize: 12, color: THEME.textDim, textAlign: "center", marginTop: 20 }}>Сообщений пока нет — напишите первым.</div>}
+          {task.chat.map(m => {
+            const isMine = m.authorName === person.name;
+            return (
+              <div key={m.id} style={{ display: "flex", justifyContent: isMine ? "flex-end" : "flex-start" }}>
+                <div style={{ maxWidth: "78%", background: isMine ? THEME.amber : THEME.panel, color: isMine ? "#1A1300" : THEME.text, borderRadius: 14, borderBottomRightRadius: isMine ? 4 : 14, borderBottomLeftRadius: isMine ? 14 : 4, padding: "7px 11px", border: isMine ? "none" : `1px solid ${THEME.line}` }}>
+                  {!isMine && <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 2, color: THEME.amber }}>{m.authorName}</div>}
+                  <div style={{ fontSize: 13, wordBreak: "break-word" }}>{linkifyText(m.text)}</div>
+                  <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", gap: 6, marginTop: 3 }}>
+                    <span style={{ fontSize: 10, opacity: 0.65 }}>{new Date(m.ts).toLocaleString("ru-RU", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}</span>
+                    {canManage && <button onClick={() => onDeleteMessage(m.id)} title="Удалить сообщение" style={{ background: "none", border: "none", cursor: "pointer", padding: 0, fontSize: 10, opacity: 0.65, color: isMine ? "#1A1300" : THEME.coral }}>✕</button>}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          <div ref={chatEndRef} />
+        </div>
+
+        {/* поле ввода — закреплено внизу */}
+        <div style={{ flexShrink: 0, padding: 12, borderTop: `1px solid ${THEME.line}`, display: "flex", gap: 8 }}>
+          <input value={text} onChange={e => setText(e.target.value)} placeholder="Написать сообщение…" style={{ ...inputStyle, flex: 1 }} onKeyDown={e => { if (e.key === "Enter" && text.trim()) { onSendMessage(task.id, text); setText(""); } }} />
+          <button onClick={() => { if (text.trim()) { onSendMessage(task.id, text); setText(""); } }} style={{ ...inputStyle, cursor: "pointer", background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>➤</button>
+        </div>
+
+        {canManage && (
+          <div style={{ flexShrink: 0, padding: "10px 12px", borderTop: `1px solid ${THEME.line}` }}>
+            {confirmDelete ? (
+              <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                <span style={{ fontSize: 12, color: THEME.coral }}>Удалить карточку насовсем?</span>
+                <button onClick={handleDeleteCard} style={{ ...inputStyle, cursor: "pointer", background: THEME.coral, color: "#2A0E0A", fontWeight: 700, border: "none", fontSize: 12 }}>Да, удалить</button>
+                <button onClick={() => setConfirmDelete(false)} style={{ ...inputStyle, cursor: "pointer", fontSize: 12 }}>Отмена</button>
+              </div>
+            ) : (
+              <button onClick={() => setConfirmDelete(true)} style={{ ...inputStyle, cursor: "pointer", color: THEME.coral, fontSize: 12 }}>Удалить карточку</button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   СОЗДАНИЕ КАРТОЧКИ — поиск клиента, опциональное назначение
+--------------------------------------------------------- */
+function CreateCardModal({ clients, monteurs, defaultMonteurId, onClose, onCreate }) {
+  const [query, setQuery] = useState("");
+  const [clientId, setClientId] = useState(null);
+  const [title, setTitle] = useState("");
+  const [monteurId, setMonteurId] = useState(defaultMonteurId != null ? String(defaultMonteurId) : "queue");
+
+  const activeClients = clients.filter(c => c.active !== false);
+  const filtered = query.trim() ? activeClients.filter(c => c.name.toLowerCase().includes(query.trim().toLowerCase())) : activeClients;
+  const selectedClient = clients.find(c => c.id === clientId);
+
+  const submit = () => {
+    if (!clientId) return;
+    const finalTitle = title.trim() || `${selectedClient.name} ${Math.ceil(Math.random() * 99)}`;
+    onCreate({ title: finalTitle, clientId, monteurId: monteurId === "queue" ? null : Number(monteurId) });
+    onClose();
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.65)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 60, padding: 16 }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{ width: 400, maxWidth: "100%", maxHeight: "88vh", overflowY: "auto", background: THEME.panel2, border: `1px solid ${THEME.line}`, borderRadius: 14, padding: 18 }}>
+        <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 14 }}>Новая карточка</div>
+
+        <Field label="Клиент — поиск или выбор из списка">
+          <input value={selectedClient ? selectedClient.name : query} onChange={e => { setQuery(e.target.value); setClientId(null); }} placeholder="Начни вводить имя клиента…" style={inputStyle} />
+        </Field>
+        {!clientId && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, marginTop: 6, maxHeight: 140, overflowY: "auto" }}>
+            {filtered.length === 0 && <div style={{ fontSize: 12, color: THEME.textDim, padding: "6px 2px" }}>Клиенты не найдены.</div>}
+            {filtered.map(c => (
+              <button key={c.id} onClick={() => { setClientId(c.id); setQuery(""); }} style={{ ...inputStyle, cursor: "pointer", textAlign: "left", display: "flex", justifyContent: "space-between" }}>
+                <span>{c.name}</span>
+                <Pill tone="dim">{complexityMap[c.complexity].label} · +{complexityMap[c.complexity].points}</Pill>
+              </button>
+            ))}
+          </div>
+        )}
+        {selectedClient && (
+          <div style={{ marginTop: 8 }}>
+            <Pill tone="teal">Выбрано: {selectedClient.name} · {complexityMap[selectedClient.complexity].label} (+{complexityMap[selectedClient.complexity].points} балл{complexityMap[selectedClient.complexity].points > 1 ? "а" : ""})</Pill>
+            <button onClick={() => setClientId(null)} style={{ ...inputStyle, cursor: "pointer", marginLeft: 8, padding: "3px 8px", fontSize: 11 }}>изменить</button>
+          </div>
+        )}
+
+        <div style={{ marginTop: 14 }}>
+          <Field label="Название карточки (необязательно)">
+            <input value={title} onChange={e => setTitle(e.target.value)} placeholder="по умолчанию — имя клиента + номер" style={inputStyle} />
+          </Field>
+        </div>
+
+        <div style={{ marginTop: 14 }}>
+          <Field label="Назначить монтажёра">
+            <select value={monteurId} onChange={e => setMonteurId(e.target.value)} style={inputStyle}>
+              <option value="queue">Оставить в очереди</option>
+              {monteurs.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+            </select>
+          </Field>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", marginTop: 18 }}>
+          <button onClick={onClose} style={{ ...inputStyle, cursor: "pointer" }}>Отмена</button>
+          <button onClick={submit} disabled={!clientId} style={{ ...inputStyle, cursor: clientId ? "pointer" : "not-allowed", opacity: clientId ? 1 : 0.5, background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>Создать</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ОДНА ДОРОЖКА ДОСКИ (набор колонок STAGES для одного владельца
+   карточек — монтажёра, или "Очереди"). Переиспользуется и для
+   личной доски монтажёра, и для каждой строки в общей доске.
+--------------------------------------------------------- */
+// автоскролл страницы, когда тащишь карточку к верхнему/нижнему краю
+// экрана — нативный HTML5 drag сам по себе страницу не крутит.
+function useDragAutoScroll() {
+  useEffect(() => {
+    const margin = 70;
+    const speed = 22;
+    const handler = e => {
+      const y = e.clientY;
+      const h = window.innerHeight;
+      if (y < margin) window.scrollBy(0, -speed);
+      else if (y > h - margin) window.scrollBy(0, speed);
+    };
+    window.addEventListener("dragover", handler);
+    return () => window.removeEventListener("dragover", handler);
+  }, []);
+}
+
+function StageColumns({ tasks, onOpenCard, dragTaskId, setDragTaskId, overCell, setOverCell, laneId, onDrop, columnLockCheck, deniedCell, setDeniedCell, monteurs, onReassign, onReorder }) {
+  const [overCardId, setOverCardId] = useState(null);
+  return (
+    <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6 }}>
+      {STAGES.map(col => {
+        const colTasks = tasks.filter(t => t.status === col.key).slice().sort((a, b) => a.position - b.position);
+        const isRevision = col.key === "revision";
+        const cellKey = `${laneId}:${col.key}`;
+        const isOver = overCell === cellKey;
+        const isDenied = deniedCell === cellKey;
+        const locked = columnLockCheck ? columnLockCheck(col.key) : false;
+        return (
+          <div
+            key={col.key}
+            onDragOver={e => { e.preventDefault(); setOverCell(cellKey); }}
+            onDragLeave={() => setOverCell(c => (c === cellKey ? null : c))}
+            onDrop={e => { e.preventDefault(); setOverCell(null); onDrop(laneId, col.key); }}
+            style={{
+              width: "clamp(175px, 17vw, 300px)", flex: "0 0 auto", alignSelf: "flex-start", maxHeight: "clamp(320px, calc(100vh - 260px), 1400px)",
+              display: "flex", flexDirection: "column",
+              background: isDenied ? "#3A1F1A" : isOver ? "#242C3A" : THEME.panel2,
+              border: `1px solid ${isDenied ? THEME.coral : isOver ? THEME.amber : THEME.line}`,
+              borderRadius: 12, padding: 8, transition: "background .15s, border-color .15s", opacity: locked ? 0.85 : 1,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, padding: "0 2px", flexShrink: 0 }}>
+              <span style={{ fontSize: 12, fontWeight: 700, color: isRevision ? THEME.coral : THEME.textDim }}>{col.label}{locked && " 🔒"}</span>
+              <Pill tone={isDenied ? "coral" : isRevision ? "coral" : "dim"}>{isDenied ? "нет доступа" : colTasks.length}</Pill>
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, overflowY: "auto", paddingRight: 2 }}>
+              {colTasks.map(t => {
+                const isCardOver = overCardId === t.id;
+                return (
+                  <div
+                    key={t.id}
+                    draggable
+                    onDragStart={() => setDragTaskId(t.id)}
+                    onDragEnd={() => { setDragTaskId(null); setOverCardId(null); }}
+                    onDragOver={e => { e.preventDefault(); e.stopPropagation(); if (onReorder) setOverCardId(t.id); }}
+                    onDragLeave={() => setOverCardId(c => (c === t.id ? null : c))}
+                    onDrop={e => {
+                      if (!onReorder) return;
+                      e.preventDefault();
+                      e.stopPropagation();
+                      setOverCardId(null);
+                      const rect = e.currentTarget.getBoundingClientRect();
+                      const insertAfter = e.clientY > rect.top + rect.height / 2;
+                      onReorder(dragTaskId, t.id, insertAfter);
+                      setDragTaskId(null);
+                    }}
+                    style={{
+                      background: THEME.panel, borderRadius: 8, padding: "7px 9px", cursor: "grab", fontSize: 12, flexShrink: 0,
+                      opacity: dragTaskId === t.id ? 0.4 : 1,
+                      borderTop: isCardOver ? `2px solid ${THEME.amber}` : "1px solid " + THEME.line,
+                      borderBottom: `1px solid ${THEME.line}`, borderLeft: `1px solid ${THEME.line}`, borderRight: `1px solid ${THEME.line}`,
+                    }}
+                  >
+                    <div onClick={() => onOpenCard(t.id)} style={{ fontWeight: 600, marginBottom: 3, display: "flex", justifyContent: "space-between", gap: 4, cursor: "pointer" }}>
+                      <span>{t.title}</span>
+                      {t.chat.length > 0 && <span style={{ color: THEME.textDim }}>💬{t.chat.length}</span>}
+                    </div>
+                    {t.paid && <Pill tone="teal">оплачено</Pill>}
+                    {onReassign && monteurs && (
+                      <select
+                        value={t.monteurId ?? "queue"}
+                        onClick={e => e.stopPropagation()}
+                        onChange={e => onReassign(t.id, e.target.value === "queue" ? null : Number(e.target.value))}
+                        style={{ ...inputStyle, width: "100%", marginTop: 6, fontSize: 11, padding: "4px 6px" }}
+                      >
+                        <option value="queue">Очередь</option>
+                        {monteurs.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                      </select>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ДОСКА МОНТАЖЁРА — только его карточки, с ограничениями прав
+--------------------------------------------------------- */
+function EditorBoard({ tasks, onMove, onOpenCard, onReorder }) {
+  const [dragTaskId, setDragTaskId] = useState(null);
+  const [overCell, setOverCell] = useState(null);
+  const [deniedCell, setDeniedCell] = useState(null);
+  const [toast, setToast] = useState(null);
+  useDragAutoScroll();
+
+  const myBacklog = tasks.filter(t => t.status === "revision").length;
+  const softBlocked = myBacklog >= REVISION_BACKLOG_LIMIT; // блокирует только новые ролики
+  const frozen = myBacklog > REVISION_BACKLOG_LIMIT; // блокирует вообще любое перемещение
+
+  const showToast = msg => {
+    setToast(msg);
+    clearTimeout(showToast._t);
+    showToast._t = setTimeout(() => setToast(null), 2500);
+  };
+
+  const canDrop = (task, toStage) => {
+    if (frozen) return false;
+    if (toStage === "for_review") return true;
+    if (toStage === "to_edit") return true;
+    if (toStage !== "in_progress") return false;
+    if (task.status !== "to_edit") return true;
+    return myBacklog < REVISION_BACKLOG_LIMIT;
+  };
+
+  const handleDrop = (laneId, colKey) => {
+    const taskId = dragTaskId;
+    setDragTaskId(null);
+    if (taskId == null) return;
+    const task = tasks.find(t => t.id === taskId);
+    if (!task || task.status === colKey) return;
+    if (!canDrop(task, colKey)) {
+      const cellKey = `${laneId}:${colKey}`;
+      setDeniedCell(cellKey);
+      setTimeout(() => setDeniedCell(null), 650);
+      if (frozen) showToast("У вас накопились правки, сначала закройте их");
+      return;
+    }
+    onMove(taskId, colKey);
+  };
+
+  const handleOpenCard = taskId => {
+    const task = tasks.find(t => t.id === taskId);
+    if (frozen && task?.status === "to_edit") {
+      showToast("У вас накопились правки, сначала закройте их");
+      return;
+    }
+    onOpenCard(taskId);
+  };
+
+  const handleReorder = (draggedId, targetId, insertAfter) => {
+    const dragged = tasks.find(t => t.id === draggedId);
+    const target = tasks.find(t => t.id === targetId);
+    if (!dragged || !target) return;
+    if (dragged.status !== target.status && !canDrop(dragged, target.status)) {
+      if (frozen) showToast("У вас накопились правки, сначала закройте их");
+      return;
+    }
+    onReorder(draggedId, targetId, insertAfter);
+  };
+
+  return (
+    <Card style={{ padding: 12, position: "relative" }}>
+      {toast && (
+        <div style={{ position: "absolute", top: 10, left: "50%", transform: "translateX(-50%)", zIndex: 30, background: THEME.coral, color: "#2A0E0A", fontWeight: 700, fontSize: 13, padding: "8px 14px", borderRadius: 10, boxShadow: "0 4px 14px rgba(0,0,0,.35)" }}>
+          {toast}
+        </div>
+      )}
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+        <div style={{ fontWeight: 600 }}>Моя доска</div>
+        <div style={{ fontSize: 11, color: THEME.textDim }}>можно переносить в «На монтаж», «В работе» и «На согласование»</div>
+      </div>
+      {frozen ? (
+        <div style={{ marginBottom: 12 }}><Pill tone="coral">У тебя {myBacklog} карточек в «Правках» — больше 4, доска заблокирована. Разбери правки, чтобы снова двигать карточки.</Pill></div>
+      ) : softBlocked ? (
+        <div style={{ marginBottom: 12 }}><Pill tone="coral">У тебя {myBacklog} карточки в «Правках» — новые ролики недоступны, пока не разберёшь хотя бы одну</Pill></div>
+      ) : null}
+      <StageColumns
+        tasks={tasks} onOpenCard={handleOpenCard} dragTaskId={dragTaskId} setDragTaskId={setDragTaskId}
+        overCell={overCell} setOverCell={setOverCell} laneId="self" onDrop={handleDrop}
+        columnLockCheck={colKey => !["to_edit", "in_progress", "for_review"].includes(colKey)}
+        deniedCell={deniedCell} setDeniedCell={setDeniedCell} onReorder={handleReorder}
+      />
+    </Card>
+  );
+}
+
+/* ---------------------------------------------------------
+   ОБЩАЯ ДОСКА (владелец / проджект) — очередь + дорожка на
+   каждого монтажёра. Карточки можно тащить между дорожками —
+   это одновременно меняет и монтажёра, и статус.
+--------------------------------------------------------- */
+function ManagerBoard({ monteurs, tasks, onMoveCard, onOpenCard, onCreateCard, onReassign, onReorder, clients }) {
+  const [dragTaskId, setDragTaskId] = useState(null);
+  const [overCell, setOverCell] = useState(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [createForMonteur, setCreateForMonteur] = useState(null);
+  const [activeTab, setActiveTab] = useState("queue");
+  useDragAutoScroll();
+
+  const queueTasks = tasks.filter(t => t.monteurId === null);
+  const queueClientIds = [...new Set(queueTasks.map(t => t.clientId))];
+  const queueClients = queueClientIds
+    .map(id => clients.find(c => c.id === id) || { id, name: "Клиент удалён", complexity: "easy" })
+    .sort((a, b) => {
+      const countB = queueTasks.filter(t => t.clientId === b.id).length;
+      const countA = queueTasks.filter(t => t.clientId === a.id).length;
+      return countB - countA || a.name.localeCompare(b.name, "ru");
+    });
+
+  const handleDrop = (laneId, colKey) => {
+    const taskId = dragTaskId;
+    setDragTaskId(null);
+    if (taskId == null) return;
+    const task = tasks.find(t => t.id === taskId);
+    if (!task) return;
+    const newMonteurId = laneId === "queue" ? null : Number(laneId);
+    if (task.monteurId === newMonteurId && task.status === colKey) return;
+    onMoveCard(taskId, newMonteurId, colKey);
+  };
+
+  const handleQueueDrop = e => {
+    e.preventDefault();
+    const taskId = dragTaskId;
+    setDragTaskId(null);
+    if (taskId == null) return;
+    onMoveCard(taskId, null, "to_edit");
+  };
+
+  const activeMonteur = monteurs.find(m => m.id === activeTab);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+        <div style={{ display: "flex", gap: 6, overflowX: "auto", flex: 1 }}>
+          <button onClick={() => setActiveTab("queue")} style={{ ...inputStyle, cursor: "pointer", whiteSpace: "nowrap", fontWeight: 600, borderColor: activeTab === "queue" ? THEME.amber : THEME.line, color: activeTab === "queue" ? THEME.amber : THEME.textDim }}>
+            Очередь {queueTasks.length > 0 && `· ${queueTasks.length}`}
+          </button>
+          {monteurs.map(m => (
+            <button key={m.id} onClick={() => setActiveTab(m.id)} style={{ ...inputStyle, cursor: "pointer", whiteSpace: "nowrap", fontWeight: 600, borderColor: activeTab === m.id ? THEME.amber : THEME.line, color: activeTab === m.id ? THEME.amber : THEME.textDim }}>
+              {m.name}
+            </button>
+          ))}
+        </div>
+        <button onClick={() => { setCreateForMonteur(activeMonteur ? activeMonteur.id : null); setShowCreate(true); }} style={{ ...inputStyle, cursor: "pointer", background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none", whiteSpace: "nowrap" }}>+ Новая карточка</button>
+      </div>
+
+      {activeTab === "queue" && (
+        <Card style={{ padding: 12 }} onDragOver={e => e.preventDefault()} onDrop={handleQueueDrop}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontWeight: 600 }}>Очередь · нераспределённые ТЗ по клиентам</div>
+            <Pill tone="amber">{queueTasks.length}</Pill>
+          </div>
+          <div style={{ display: "flex", gap: 10, overflowX: "auto", paddingBottom: 6 }}>
+            {queueClients.length === 0 && <div style={{ fontSize: 12, color: THEME.textDim, padding: "8px 2px" }}>Очередь пуста — все ТЗ распределены.</div>}
+            {queueClients.map(client => {
+              const clientTasks = queueTasks.filter(t => t.clientId === client.id);
+              return (
+                <div key={client.id} style={{ width: "clamp(175px, 17vw, 300px)", flex: "0 0 auto", alignSelf: "flex-start", maxHeight: "clamp(320px, calc(100vh - 260px), 1400px)", display: "flex", flexDirection: "column", background: THEME.panel2, border: `1px solid ${THEME.line}`, borderRadius: 12, padding: 8 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, padding: "0 2px", flexShrink: 0 }}>
+                    <span style={{ fontSize: 12, fontWeight: 700, color: THEME.textDim }}>{client.name}</span>
+                    <Pill tone="amber">{clientTasks.length}</Pill>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, overflowY: "auto", paddingRight: 2 }}>
+                    {clientTasks.map(t => (
+                      <div key={t.id} draggable onDragStart={() => setDragTaskId(t.id)} onDragEnd={() => setDragTaskId(null)} style={{ background: THEME.panel, border: `1px solid ${THEME.line}`, borderRadius: 8, padding: "7px 9px", cursor: "grab", opacity: dragTaskId === t.id ? 0.4 : 1, fontSize: 12, flexShrink: 0 }}>
+                        <div onClick={() => onOpenCard(t.id)} style={{ fontWeight: 600, marginBottom: 3, cursor: "pointer" }}>{t.title}</div>
+                        <Pill tone="dim">{complexityMap[client.complexity].label}</Pill>
+                        <select
+                          value="queue"
+                          onClick={e => e.stopPropagation()}
+                          onChange={e => onReassign(t.id, Number(e.target.value))}
+                          style={{ ...inputStyle, width: "100%", marginTop: 6, fontSize: 11, padding: "4px 6px" }}
+                        >
+                          <option value="queue" disabled>Назначить…</option>
+                          {monteurs.map(m => <option key={m.id} value={m.id}>{m.name}</option>)}
+                        </select>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ fontSize: 11, color: THEME.textDim, marginTop: 8 }}>Столбик клиента появляется, как только у него есть ролик в очереди, и исчезает, когда все его ролики распределены. Перетащи карточку сюда, чтобы снять монтажёра, или перетащи отсюда на дорожку монтажёра, чтобы назначить.</div>
+        </Card>
+      )}
+
+      {activeMonteur && (() => {
+        const myTasks = tasks.filter(t => t.monteurId === activeMonteur.id);
+        return (
+          <Card style={{ padding: 12 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+              <div style={{ fontWeight: 600 }}>{activeMonteur.name} <span style={{ color: THEME.textDim, fontWeight: 400 }}>· грейд {activeMonteur.gradeLevel}</span></div>
+            </div>
+            <StageColumns tasks={myTasks} onOpenCard={onOpenCard} dragTaskId={dragTaskId} setDragTaskId={setDragTaskId} overCell={overCell} setOverCell={setOverCell} laneId={activeMonteur.id} onDrop={handleDrop} deniedCell={null} setDeniedCell={() => {}} monteurs={monteurs} onReassign={onReassign} onReorder={onReorder} />
+          </Card>
+        );
+      })()}
+
+      {showCreate && (
+        <CreateCardModal clients={clients} monteurs={monteurs} defaultMonteurId={createForMonteur} onClose={() => setShowCreate(false)} onCreate={onCreateCard} />
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ЛИЧНЫЙ КАБИНЕТ МОНТАЖЁРА — только деньги за ролики и баллы
+--------------------------------------------------------- */
+function EditorCabinet({ monteur, tasks, revisions, clients, grades, monteurs, longVideoBonus, onToggleLongVideo, canEditPayments, onEditPaidAmount }) {
+  const stats = monthlyStats(monteur.id, tasks, revisions, clients, grades, monteurs, longVideoBonus);
+  const paidThisMonth = tasks
+    .filter(t => t.monteurId === monteur.id && t.paid && isSameMonth(t.paidAt))
+    .slice()
+    .sort((a, b) => b.paidAt - a.paidAt);
+  const [editingId, setEditingId] = useState(null);
+  const [editValue, setEditValue] = useState("");
+
+  const startEdit = t => { setEditingId(t.id); setEditValue(String(Math.round(t.longVideo ? longVideoBonus : t.paidAmount))); };
+  const saveEdit = taskId => {
+    const value = Number(editValue);
+    if (!Number.isNaN(value) && value >= 0) onEditPaidAmount(taskId, value);
+    setEditingId(null);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <div style={{ fontSize: 13, color: THEME.textDim, marginBottom: 2 }}>Грейд {monteur.gradeLevel} · ставка {stats.rate}₽/ролик</div>
+        <div style={{ fontSize: 28, fontWeight: 700, marginBottom: 12 }}>{fmt(stats.moneySum)} ₽ <span style={{ fontSize: 13, fontWeight: 400, color: THEME.textDim }}>за готовые ролики в этом месяце</span></div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: 12 }}>
+          <Stat label="Роликов готово" value={stats.count} />
+          <Stat label="Баллы за месяц" value={stats.points} accent />
+          <Stat label="Карточек в правках сейчас" value={stats.revisionsNow} />
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+          <div style={{ fontWeight: 600 }}>Готовые ролики в этом месяце</div>
+          <Pill tone="amber">{fmt(stats.moneySum)} ₽ всего</Pill>
+        </div>
+        {paidThisMonth.length === 0 && <div style={{ fontSize: 13, color: THEME.textDim }}>Пока ничего не оплачено в этом месяце.</div>}
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {paidThisMonth.map(t => {
+            const client = clients.find(c => c.id === t.clientId);
+            const rowTotal = t.longVideo ? longVideoBonus : t.paidAmount;
+            const isEditing = editingId === t.id;
+            return (
+              <div key={t.id} style={{ borderBottom: `1px solid ${THEME.line}`, paddingBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, marginBottom: 4, gap: 8 }}>
+                  <span style={{ fontWeight: 600 }}>{t.title}</span>
+                  {isEditing ? (
+                    <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                      <input type="number" autoFocus value={editValue} onChange={e => setEditValue(e.target.value)} onKeyDown={e => e.key === "Enter" && saveEdit(t.id)} style={{ ...inputStyle, width: 90, padding: "4px 8px" }} />
+                      <button onClick={() => saveEdit(t.id)} style={{ ...inputStyle, cursor: "pointer", padding: "4px 8px", background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>✓</button>
+                      <button onClick={() => setEditingId(null)} style={{ ...inputStyle, cursor: "pointer", padding: "4px 8px" }}>✕</button>
+                    </div>
+                  ) : (
+                    <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ fontWeight: 700, color: THEME.amber }}>{fmt(rowTotal)} ₽</span>
+                      {canEditPayments && <button onClick={() => startEdit(t)} style={{ ...inputStyle, cursor: "pointer", padding: "3px 7px", fontSize: 11 }}>изменить</button>}
+                    </span>
+                  )}
+                </div>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12, color: THEME.textDim, flexWrap: "wrap", gap: 6 }}>
+                  <span>{client?.name} · {new Date(t.paidAt).toLocaleDateString("ru-RU")} · обычная ставка {fmt(t.paidAmount)}₽</span>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, cursor: "pointer" }}>
+                    <input type="checkbox" checked={t.longVideo} onChange={() => onToggleLongVideo(t.id)} />
+                    <span>Ролик больше двух минут {t.longVideo && <span style={{ color: THEME.amber, fontWeight: 700 }}>· всего {fmt(longVideoBonus)}₽ за ролик</span>}</span>
+                  </label>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+        {canEditPayments && <div style={{ fontSize: 11, color: THEME.textDim, marginTop: 10 }}>Ручное изменение суммы заменяет собой обычный расчёт по грейду/доплате за длинный ролик для этой карточки.</div>}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Баллы по сложности клиентов</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}><span>Лёгкие (+1 балл)</span><b>{stats.byComplexity.easy}</b></div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}><span>Средние (+2 балла)</span><b>{stats.byComplexity.medium}</b></div>
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}><span>Сложные (+3 балла)</span><b>{stats.byComplexity.hard}</b></div>
+        </div>
+        <div style={{ fontSize: 11, color: THEME.textDim, marginTop: 10 }}>Баллы пока считаются для наблюдения — как их учитывать при оплате, решим по итогам месяца.</div>
+      </Card>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ВЛАДЕЛЕЦ / ПРОДЖЕКТ: кабинеты монтажёров — просмотр и правка сумм
+--------------------------------------------------------- */
+function MonteurCabinetsPage({ monteurs, tasks, revisions, clients, grades, longVideoBonus, onToggleLongVideo, onEditPaidAmount }) {
+  const [selectedId, setSelectedId] = useState(monteurs[0]?.id ?? null);
+  const selected = monteurs.find(m => m.id === selectedId);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card style={{ padding: 12 }}>
+        <div style={{ fontSize: 12, color: THEME.textDim, marginBottom: 8 }}>Выберите монтажёра</div>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {monteurs.map(m => (
+            <button key={m.id} onClick={() => setSelectedId(m.id)} style={{ ...inputStyle, cursor: "pointer", fontWeight: 600, borderColor: selectedId === m.id ? THEME.amber : THEME.line, color: selectedId === m.id ? THEME.amber : THEME.text }}>
+              {m.name}
+            </button>
+          ))}
+        </div>
+      </Card>
+
+      {selected && (
+        <EditorCabinet
+          monteur={selected}
+          tasks={tasks}
+          revisions={revisions}
+          clients={clients}
+          grades={grades}
+          monteurs={monteurs}
+          longVideoBonus={longVideoBonus}
+          onToggleLongVideo={onToggleLongVideo}
+          canEditPayments
+          onEditPaidAmount={onEditPaidAmount}
+        />
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ВЛАДЕЛЕЦ / ПРОДЖЕКТ: клиенты и сложность
+--------------------------------------------------------- */
+function ClientsPage({ clients, setClients, onAddClient }) {
+  const [newName, setNewName] = useState("");
+  const [newComplexity, setNewComplexity] = useState("easy");
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null);
+
+  const addClient = () => {
+    if (!newName.trim()) return;
+    onAddClient({ name: newName.trim(), complexity: newComplexity });
+    setNewName("");
+  };
+
+  const updateName = (id, name) => setClients(cs => cs.map(x => (x.id === id ? { ...x, name } : x)));
+  const updateComplexity = (id, complexity) => setClients(cs => cs.map(x => (x.id === id ? { ...x, complexity } : x)));
+  const deleteClient = id => { setClients(cs => cs.map(x => (x.id === id ? { ...x, active: false } : x))); setConfirmDeleteId(null); };
+  const restoreClient = id => setClients(cs => cs.map(x => (x.id === id ? { ...x, active: true } : x)));
+
+  const active = clients.filter(c => c.active !== false);
+  const archived = clients.filter(c => c.active === false);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Клиенты и сложность</div>
+        <div style={{ fontSize: 11, color: THEME.textDim, marginBottom: 12 }}>Сложность даёт баллы за ролик: лёгкий +1, средний +2, сложный +3. Монтажёры эту базу не видят.</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+          {active.map(c => (
+            <div key={c.id} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
+              <input value={c.name} onChange={e => updateName(c.id, e.target.value)} style={{ ...inputStyle, flex: 1 }} />
+              <select value={c.complexity} onChange={e => updateComplexity(c.id, e.target.value)} style={inputStyle}>
+                {Object.entries(complexityMap).map(([k, v]) => <option key={k} value={k}>{v.label} (+{v.points} балл{v.points > 1 ? "а" : ""})</option>)}
+              </select>
+              {confirmDeleteId === c.id ? (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => deleteClient(c.id)} style={{ ...inputStyle, cursor: "pointer", background: THEME.coral, color: "#2A0E0A", fontWeight: 700, border: "none", fontSize: 12 }}>Точно удалить</button>
+                  <button onClick={() => setConfirmDeleteId(null)} style={{ ...inputStyle, cursor: "pointer", fontSize: 12 }}>Отмена</button>
+                </div>
+              ) : (
+                <button onClick={() => setConfirmDeleteId(c.id)} style={{ ...inputStyle, cursor: "pointer", fontSize: 12, color: THEME.coral }}>Удалить</button>
+              )}
+            </div>
+          ))}
+          {active.length === 0 && <div style={{ fontSize: 13, color: THEME.textDim }}>Активных клиентов пока нет.</div>}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", borderTop: `1px solid ${THEME.line}`, paddingTop: 12 }}>
+          <input placeholder="Имя клиента" value={newName} onChange={e => setNewName(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 140 }} />
+          <select value={newComplexity} onChange={e => setNewComplexity(e.target.value)} style={inputStyle}>
+            {Object.entries(complexityMap).map(([k, v]) => <option key={k} value={k}>{v.label}</option>)}
+          </select>
+          <button onClick={addClient} style={{ ...inputStyle, cursor: "pointer", background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>Добавить</button>
+        </div>
+      </Card>
+
+      {archived.length > 0 && (
+        <Card>
+          <div style={{ fontWeight: 600, marginBottom: 6 }}>Удалённые клиенты</div>
+          <div style={{ fontSize: 11, color: THEME.textDim, marginBottom: 12 }}>Скрыты из выбора при создании новых карточек, но их старые ролики никуда не делись — остаются в истории и статистике монтажёров как есть.</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {archived.map(c => (
+              <div key={c.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, color: THEME.textDim }}>
+                <span>{c.name} · {complexityMap[c.complexity].label}</span>
+                <button onClick={() => restoreClient(c.id)} style={{ ...inputStyle, cursor: "pointer", fontSize: 12 }}>Восстановить</button>
+              </div>
+            ))}
+          </div>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ВЛАДЕЛЕЦ: монтажёры и грейды — имена и грейды редактируются
+--------------------------------------------------------- */
+function MonteursPage({ monteurs, setMonteurs, grades, setGrades, longVideoBonus, setLongVideoBonus, onAddMonteur }) {
+  const [newName, setNewName] = useState("");
+  const [newGrade, setNewGrade] = useState(1);
+
+  const addMonteur = () => {
+    if (!newName.trim()) return;
+    onAddMonteur({ name: newName.trim(), gradeLevel: newGrade });
+    setNewName("");
+    setNewGrade(1);
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Монтажёры</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8, marginBottom: 14 }}>
+          {monteurs.map(m => (
+            <div key={m.id} style={{ display: "flex", gap: 8, alignItems: "center", fontSize: 13 }}>
+              <input value={m.name} onChange={e => setMonteurs(ms => ms.map(x => (x.id === m.id ? { ...x, name: e.target.value } : x)))} style={{ ...inputStyle, flex: 1 }} />
+              <select value={m.gradeLevel} onChange={e => setMonteurs(ms => ms.map(x => (x.id === m.id ? { ...x, gradeLevel: Number(e.target.value) } : x)))} style={inputStyle}>
+                {grades.map(g => <option key={g.level} value={g.level}>Грейд {g.level} — {g.rate}₽/ролик</option>)}
+              </select>
+            </div>
+          ))}
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", borderTop: `1px solid ${THEME.line}`, paddingTop: 12 }}>
+          <input placeholder="Имя монтажёра" value={newName} onChange={e => setNewName(e.target.value)} style={{ ...inputStyle, flex: 1, minWidth: 140 }} />
+          <select value={newGrade} onChange={e => setNewGrade(Number(e.target.value))} style={inputStyle}>
+            {grades.map(g => <option key={g.level} value={g.level}>Грейд {g.level}</option>)}
+          </select>
+          <button onClick={addMonteur} style={{ ...inputStyle, cursor: "pointer", background: THEME.amber, color: "#1A1300", fontWeight: 700, border: "none" }}>Добавить</button>
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Ставки по грейдам (₽ за ролик)</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(110px,1fr))", gap: 8 }}>
+          {grades.map(g => (
+            <Field key={g.level} label={`Грейд ${g.level}`}>
+              <input type="number" value={g.rate} onChange={e => setGrades(gs => gs.map(x => (x.level === g.level ? { ...x, rate: Number(e.target.value) } : x)))} style={inputStyle} />
+            </Field>
+          ))}
+        </div>
+        <div style={{ marginTop: 12 }}>
+          <Field label="Фиксированная оплата за ролик длиннее 2 минут (₽, вместо обычной ставки)">
+            <input type="number" value={longVideoBonus} onChange={e => setLongVideoBonus(Number(e.target.value))} style={{ ...inputStyle, maxWidth: 160 }} />
+          </Field>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   ПРОДЖЕКТ / ВЛАДЕЛЕЦ: статистика по команде
+--------------------------------------------------------- */
+function TeamStatsPage({ monteurs, tasks, revisions, clients, grades, longVideoBonus, showMoney }) {
+  const months = lastNMonths(3);
+  const [monthIdx, setMonthIdx] = useState(0);
+  const refDate = months[monthIdx];
+  const isCurrentMonth = monthIdx === 0;
+
+  const rows = monteurs
+    .map(m => monthlyStats(m.id, tasks, revisions, clients, grades, monteurs, longVideoBonus, refDate))
+    .sort((a, b) => b.count - a.count); // рейтинг: больше роликов — выше в таблице
+  const totalVideos = rows.reduce((s, r) => s + r.count, 0);
+  const totalPoints = rows.reduce((s, r) => s + r.points, 0);
+  const totalRevisions = rows.reduce((s, r) => s + r.revisionsThisMonth, 0);
+  const totalMoney = rows.reduce((s, r) => s + r.moneySum, 0);
+  const queueTasks = tasks.filter(t => t.monteurId === null);
+  const queueCount = queueTasks.length;
+  const queueByClient = [...new Set(queueTasks.map(t => t.clientId))]
+    .map(id => ({ client: clients.find(c => c.id === id) || { name: "Клиент удалён" }, count: queueTasks.filter(t => t.clientId === id).length }))
+    .sort((a, b) => b.count - a.count);
+
+  // топ по правкам — за всё время (не за месяц), чтобы видеть, где реально
+  // больше всего трений с клиентом, а не только за текущий период
+  const revisionsByTaskId = {};
+  revisions.forEach(r => { revisionsByTaskId[r.taskId] = (revisionsByTaskId[r.taskId] || 0) + 1; });
+  const topTasks = Object.entries(revisionsByTaskId)
+    .map(([taskId, count]) => ({ task: tasks.find(t => t.id === Number(taskId)), count }))
+    .filter(x => x.task)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  const revisionsByClientId = {};
+  revisions.forEach(r => {
+    const t = tasks.find(x => x.id === r.taskId);
+    if (!t) return;
+    revisionsByClientId[t.clientId] = (revisionsByClientId[t.clientId] || 0) + 1;
+  });
+  const topClients = Object.entries(revisionsByClientId)
+    .map(([clientId, count]) => ({ client: clients.find(c => c.id === Number(clientId)), count }))
+    .filter(x => x.client)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 5);
+
+  const pipeline = STAGES.map(s => ({ label: s.label, count: tasks.filter(t => t.status === s.key).length }));
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+      <Card>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+          <div style={{ fontWeight: 600 }}>Рейтинг по монтажёрам — по количеству роликов</div>
+          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+            <select value={monthIdx} onChange={e => setMonthIdx(Number(e.target.value))} style={inputStyle}>
+              {months.map((d, i) => <option key={i} value={i}>{monthLabel(d)}{i === 0 ? " (текущий)" : ""}</option>)}
+            </select>
+            {showMoney && <button style={{ ...inputStyle, cursor: "pointer" }} onClick={() => exportCsv(rows.map(r => `${r.monteur.name},${r.count},${r.points},${r.pct.easy}%,${r.pct.medium}%,${r.pct.hard}%,${r.revisionsThisMonth},${Math.round(r.moneySum)}`), `statistika_${monthLabel(refDate)}.csv`, "Монтажёр,Роликов,Баллы,%Лёгких,%Средних,%Сложных,Правок,Оплачено")}>Экспорт CSV</button>}
+          </div>
+        </div>
+        <div style={{ overflowX: "auto" }}>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+            <thead>
+              <tr style={{ color: THEME.textDim, textAlign: "left" }}>
+                <th style={{ padding: "4px 8px" }}>Место</th><th>Монтажёр</th><th>Роликов</th><th>Баллы</th><th>%Лёгких</th><th>%Средних</th><th>%Сложных</th><th>Правок{isCurrentMonth ? "" : "*"}</th>{showMoney && <th>Оплачено</th>}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={r.monteur.id} style={{ borderTop: `1px solid ${THEME.line}` }}>
+                  <td style={{ padding: "6px 8px", fontWeight: 700, color: i === 0 ? THEME.amber : THEME.text }}>{i + 1}</td>
+                  <td>{r.monteur.name}</td>
+                  <td style={{ fontWeight: 700 }}>{r.count}</td>
+                  <td>{r.points}</td>
+                  <td>{r.pct.easy}%</td>
+                  <td>{r.pct.medium}%</td>
+                  <td>{r.pct.hard}%</td>
+                  <td>{r.revisionsThisMonth}</td>
+                  {showMoney && <td style={{ fontWeight: 700 }}>{fmt(r.moneySum)} ₽</td>}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        {!isCurrentMonth && <div style={{ fontSize: 11, color: THEME.textDim, marginTop: 8 }}>* для прошлых месяцев число правок в архиве не сохранялось — показывается только для текущего месяца.</div>}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Общее по студии — {monthLabel(refDate)}</div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(120px,1fr))", gap: 12 }}>
+          <Stat label="Роликов за месяц" value={totalVideos} />
+          <Stat label="Баллы за месяц" value={totalPoints} accent />
+          <Stat label="Правок за месяц" value={totalRevisions} />
+          <Stat label="В очереди сейчас" value={queueCount} />
+          {showMoney && <Stat label="Выплачено за месяц" value={`${fmt(totalMoney)} ₽`} />}
+        </div>
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Очередь по клиентам · {queueCount} всего</div>
+        {queueByClient.length === 0 ? (
+          <div style={{ fontSize: 13, color: THEME.textDim }}>Очередь пуста — все ТЗ распределены.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {queueByClient.map(q => (
+              <div key={q.client.name} style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+                <span style={{ color: THEME.textDim }}>{q.client.name}</span>
+                <span style={{ fontWeight: 600 }}>{q.count}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Топ-5 роликов по количеству правок</div>
+        <div style={{ fontSize: 11, color: THEME.textDim, marginBottom: 10 }}>За всё время — чтобы видеть, где реально больше всего трений с клиентом, а не только за текущий месяц.</div>
+        {topTasks.length === 0 ? (
+          <div style={{ fontSize: 13, color: THEME.textDim }}>Правок пока не было ни у одной карточки.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {topTasks.map((x, i) => {
+              const m = monteurs.find(mm => mm.id === x.task.monteurId);
+              const c = clients.find(cc => cc.id === x.task.clientId);
+              return (
+                <div key={x.task.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, borderBottom: `1px solid ${THEME.line}`, paddingBottom: 6 }}>
+                  <span>{i + 1}. {x.task.title} <span style={{ color: THEME.textDim }}>· {m?.name ?? "не назначен"} · {c?.name ?? "—"}</span></span>
+                  <Pill tone="coral">{x.count} правок</Pill>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 4 }}>Топ-5 клиентов по количеству правок</div>
+        <div style={{ fontSize: 11, color: THEME.textDim, marginBottom: 10 }}>Суммарно по всем их роликам, за всё время.</div>
+        {topClients.length === 0 ? (
+          <div style={{ fontSize: 13, color: THEME.textDim }}>Правок пока не было.</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {topClients.map((x, i) => (
+              <div key={x.client.id ?? i} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 13, borderBottom: `1px solid ${THEME.line}`, paddingBottom: 6 }}>
+                <span>{i + 1}. {x.client.name}</span>
+                <Pill tone="coral">{x.count} правок</Pill>
+              </div>
+            ))}
+          </div>
+        )}
+      </Card>
+
+      <Card>
+        <div style={{ fontWeight: 600, marginBottom: 10 }}>Где сейчас карточки (вся студия)</div>
+        <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          {pipeline.map(p => (
+            <div key={p.label} style={{ display: "flex", justifyContent: "space-between", fontSize: 13 }}>
+              <span style={{ color: THEME.textDim }}>{p.label}</span>
+              <span style={{ fontWeight: 600 }}>{p.count}</span>
+            </div>
+          ))}
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------
+   SUPABASE — подключение к настоящей общей базе
+--------------------------------------------------------- */
+const SUPABASE_URL = "https://bwlnnsqbqkkngzwfefvc.supabase.co";
+const SUPABASE_ANON_KEY = "sb_publishable_qnQY1cE43vjnk7NIr7pctg_C62qQJWG";
+const REST = `${SUPABASE_URL}/rest/v1`;
+const SB_HEADERS = { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` };
+
+// вместо библиотеки supabase-js — простые обёртки поверх fetch(),
+// чтобы не зависеть от того, как именно та или иная CDN отдаёт
+// внешнюю библиотеку. Работает с любым современным браузером "из коробки".
+async function sbSelect(table, params = "") {
+  const res = await fetch(`${REST}/${table}?select=*${params}`, { headers: SB_HEADERS });
+  if (!res.ok) throw new Error(`${table}: ${res.status} ${await res.text()}`);
+  return res.json();
+}
+async function sbInsert(table, row, returning = false) {
+  const res = await fetch(`${REST}/${table}`, {
+    method: "POST",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: returning ? "return=representation" : "return=minimal" },
+    body: JSON.stringify(row),
+  });
+  if (!res.ok) throw new Error(`${table} insert: ${res.status} ${await res.text()}`);
+  return returning ? res.json() : null;
+}
+async function sbUpdate(table, patch, filterQuery) {
+  const res = await fetch(`${REST}/${table}?${filterQuery}`, {
+    method: "PATCH",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "return=minimal" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error(`${table} update: ${res.status} ${await res.text()}`);
+}
+async function sbUpsert(table, rows, onConflict) {
+  const res = await fetch(`${REST}/${table}?on_conflict=${onConflict}`, {
+    method: "POST",
+    headers: { ...SB_HEADERS, "Content-Type": "application/json", Prefer: "resolution=merge-duplicates,return=minimal" },
+    body: JSON.stringify(rows),
+  });
+  if (!res.ok) throw new Error(`${table} upsert: ${res.status} ${await res.text()}`);
+}
+async function sbDelete(table, filterQuery) {
+  const res = await fetch(`${REST}/${table}?${filterQuery}`, {
+    method: "DELETE",
+    headers: { ...SB_HEADERS, Prefer: "return=minimal" },
+  });
+  if (!res.ok) throw new Error(`${table} delete: ${res.status} ${await res.text()}`);
+}
+
+function mapMonteurRow(r) { return { id: r.id, name: r.name, gradeLevel: r.grade_level }; }
+function mapClientRow(r) { return { id: r.id, name: r.name, complexity: r.complexity, active: r.active !== false }; }
+function mapGradeRow(r) { return { level: r.level, rate: Number(r.rate) }; }
+function mapTaskRow(r, stageLogRows, messageRows) {
+  return {
+    id: r.id,
+    title: r.title,
+    clientId: r.client_id,
+    monteurId: r.monteur_id,
+    status: r.status,
+    paid: r.paid,
+    paidAmount: Number(r.paid_amount) || 0,
+    paidAt: r.paid_at ? new Date(r.paid_at).getTime() : null,
+    longVideo: r.long_video,
+    position: r.position != null ? Number(r.position) : r.id,
+    stageLog: stageLogRows
+      .filter(s => s.task_id === r.id)
+      .map(s => ({ stage: s.stage, enteredAt: new Date(s.entered_at).getTime(), exitedAt: s.exited_at ? new Date(s.exited_at).getTime() : null })),
+    chat: messageRows
+      .filter(m => m.task_id === r.id)
+      .map(m => ({ id: m.id, authorId: m.author_id, authorName: m.author_name, text: m.text, ts: new Date(m.created_at).getTime() })),
+  };
+}
+function mapRevisionRow(r) { return { id: r.id, taskId: r.task_id, monteurId: r.monteur_id, ts: new Date(r.created_at).getTime() }; }
+
+async function loadAllFromSupabase() {
+  const [monteursData, clientsData, gradesData, settingsData, tasksData, stageLogData, messagesData, revisionsData] = await Promise.all([
+    sbSelect("monteurs", "&order=id"),
+    sbSelect("clients", "&order=id"),
+    sbSelect("grades", "&order=level"),
+    sbSelect("settings"),
+    sbSelect("tasks", "&order=id"),
+    sbSelect("task_stage_log"),
+    sbSelect("task_messages", "&order=created_at"),
+    sbSelect("revisions"),
+  ]);
+
+  const monteurs = monteursData.map(mapMonteurRow);
+  const clients = clientsData.map(mapClientRow);
+  const grades = gradesData.map(mapGradeRow);
+  const longVideoRow = settingsData.find(s => s.key === "long_video_bonus");
+  const longVideoBonus = longVideoRow ? Number(longVideoRow.value) : DEFAULT_LONG_VIDEO_BONUS;
+  const tasks = tasksData.map(r => mapTaskRow(r, stageLogData, messagesData));
+  const revisions = revisionsData.map(mapRevisionRow);
+
+  return { monteurs, clients, grades, longVideoBonus, tasks, revisions };
+}
+
+
+/* ---------------------------------------------------------
+   ROOT APP
+--------------------------------------------------------- */
+function App() {
+  const [loggedInId, setLoggedInId] = useState(null);
+  const [activePage, setActivePage] = useState("board");
+  const [monteurs, setMonteurs] = useState([]);
+  const [clients, setClients] = useState([]);
+  const [grades, setGrades] = useState(defaultGrades);
+  const [longVideoBonus, setLongVideoBonus] = useState(DEFAULT_LONG_VIDEO_BONUS);
+  const [tasks, setTasks] = useState([]);
+  const [revisions, setRevisions] = useState([]);
+  const [selectedCardId, setSelectedCardId] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
+
+  const refresh = () => {
+    loadAllFromSupabase()
+      .then(d => {
+        setMonteurs(d.monteurs);
+        setClients(d.clients);
+        if (d.grades.length) setGrades(d.grades);
+        setLongVideoBonus(d.longVideoBonus);
+        setTasks(d.tasks);
+        setRevisions(d.revisions);
+        setLoadError(null);
+      })
+      .catch(err => { console.error(err); setLoadError(String(err)); })
+      .finally(() => setLoading(false));
+  };
+
+  // список монтажёров подгружаем сразу при открытии сайта, ещё до входа —
+  // чтобы на экране входа были актуальные имена, а не то, что зашито в коде.
+  useEffect(() => {
+    sbSelect("monteurs", "&order=id").then(data => setMonteurs(data.map(mapMonteurRow))).catch(console.error);
+  }, []);
+
+  useEffect(() => {
+    if (!loggedInId) return;
+    setLoading(true);
+    refresh();
+    // опрашиваем базу каждые несколько секунд вместо realtime-подписки —
+    // чуть менее мгновенно, зато не зависит ни от какой внешней библиотеки.
+    const interval = setInterval(refresh, 4000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line
+  }, [loggedInId]);
+
+  // монтажёры / клиенты / грейды / настройка длинного ролика — правки детей
+  // (выпадающие списки, инпуты) пишем в базу сразу же при изменении.
+  const persistMonteurs = next => { setMonteurs(next); sbUpsert("monteurs", next.map(m => ({ id: m.id, name: m.name, grade_level: m.gradeLevel })), "id").catch(console.error); };
+  const persistClients = next => { setClients(next); sbUpsert("clients", next.map(c => ({ id: c.id, name: c.name, complexity: c.complexity, active: c.active !== false })), "id").catch(console.error); };
+  const persistGrades = next => { setGrades(next); sbUpsert("grades", next.map(g => ({ level: g.level, rate: g.rate })), "level").catch(console.error); };
+  const persistLongVideoBonus = next => { setLongVideoBonus(next); sbUpsert("settings", [{ key: "long_video_bonus", value: next }], "key").catch(console.error); };
+
+  // добавление НОВЫХ клиентов/монтажёров — id не придумываем на клиенте
+  // (это и приводило к столкновениям после перезагрузки страницы),
+  // а даём базе присвоить его самой через обычный insert.
+  const addClientRow = async ({ name, complexity }) => {
+    try { await sbInsert("clients", { name, complexity, active: true }); } catch (e) { console.error(e); }
+    refresh();
+  };
+  const addMonteurRow = async ({ name, gradeLevel }) => {
+    try { await sbInsert("monteurs", { name, grade_level: gradeLevel }); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  // React-компоненты ниже вызывают setMonteurs(ms => ...) в виде функции-обновления —
+  // заворачиваем в обёртку, которая считает новый массив и сразу сохраняет его.
+  const wrapUpdater = (current, persistFn) => updater => persistFn(typeof updater === "function" ? updater(current) : updater);
+
+  const moveCard = async (taskId, newMonteurId, newStatus) => {
+    const t = tasks.find(x => x.id === taskId);
+    if (!t) return;
+    const nowIso = new Date().toISOString();
+    let paid = t.paid, paidAmount = t.paidAmount, paidAtIso = t.paidAt ? new Date(t.paidAt).toISOString() : null;
+    if (newStatus === PAY_STAGE && !t.paid && newMonteurId != null) {
+      const m = monteurs.find(x => x.id === newMonteurId);
+      if (m) { paid = true; paidAmount = rateForGrade(m.gradeLevel, grades); paidAtIso = nowIso; }
+    }
+    try {
+      await sbUpdate("tasks", { monteur_id: newMonteurId, status: newStatus, paid, paid_amount: paidAmount, paid_at: paidAtIso }, `id=eq.${taskId}`);
+      await sbUpdate("task_stage_log", { exited_at: nowIso }, `task_id=eq.${taskId}&exited_at=is.null`);
+      await sbInsert("task_stage_log", { task_id: taskId, stage: newStatus, entered_at: nowIso });
+      if (newStatus === "revision") await sbInsert("revisions", { task_id: taskId, monteur_id: newMonteurId });
+    } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const moveOwnStatus = (taskId, newStatus) => {
+    const t = tasks.find(x => x.id === taskId);
+    moveCard(taskId, t?.monteurId ?? null, newStatus);
+  };
+
+  // перетаскивание карточки ПРЯМО НА другую карточку — меняем приоритет
+  // (порядок) внутри столбика. Если столбик/монтажёр при этом другой —
+  // сначала обычный перенос, потом ставим точную позицию.
+  const reorderTask = async (draggedId, targetId, insertAfter) => {
+    if (draggedId === targetId) return;
+    const target = tasks.find(t => t.id === targetId);
+    const dragged = tasks.find(t => t.id === draggedId);
+    if (!target || !dragged) return;
+
+    if (dragged.status !== target.status || dragged.monteurId !== target.monteurId) {
+      await moveCard(draggedId, target.monteurId, target.status);
+    }
+
+    const siblings = tasks
+      .filter(t => t.status === target.status && t.monteurId === target.monteurId && t.id !== draggedId)
+      .sort((a, b) => a.position - b.position);
+    const targetIdx = siblings.findIndex(t => t.id === targetId);
+    const neighbor = siblings[insertAfter ? targetIdx + 1 : targetIdx - 1];
+    const newPos = neighbor ? (target.position + neighbor.position) / 2 : target.position + (insertAfter ? 1 : -1);
+
+    try { await sbUpdate("tasks", { position: newPos }, `id=eq.${draggedId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const createCard = async ({ title, clientId, monteurId }) => {
+    try {
+      const rows = await sbInsert("tasks", { title, client_id: clientId, monteur_id: monteurId, status: "to_edit", paid: false, paid_amount: 0, long_video: false, position: Date.now() }, true);
+      const newId = rows && rows[0] && rows[0].id;
+      if (newId) await sbInsert("task_stage_log", { task_id: newId, stage: "to_edit", entered_at: new Date().toISOString() });
+    } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const sendMessage = async (taskId, text) => {
+    const person = buildPeople(monteurs).find(p => p.id === loggedInId);
+    try { await sbInsert("task_messages", { task_id: taskId, author_name: person.name, text }); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const reassignTask = async (taskId, monteurId) => {
+    try { await sbUpdate("tasks", { monteur_id: monteurId }, `id=eq.${taskId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const editCardTitle = async (taskId, newTitle) => {
+    try { await sbUpdate("tasks", { title: newTitle }, `id=eq.${taskId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const deleteCard = async taskId => {
+    // task_stage_log / task_messages / revisions настроены с "on delete cascade" —
+    // удаление карточки само подчистит её историю, чат и записи о правках.
+    try { await sbDelete("tasks", `id=eq.${taskId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const deleteMessage = async messageId => {
+    try { await sbDelete("task_messages", `id=eq.${messageId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  const toggleLongVideo = async taskId => {
+    const t = tasks.find(x => x.id === taskId);
+    if (!t) return;
+    try { await sbUpdate("tasks", { long_video: !t.longVideo }, `id=eq.${taskId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  // владелец/проджект правят сумму за конкретный ролик вручную —
+  // это заменяет собой обычный расчёт, поэтому заодно снимаем галочку
+  // "длинный ролик", чтобы её фиксированная сумма не перебивала правку.
+  const editPaidAmount = async (taskId, newAmount) => {
+    try { await sbUpdate("tasks", { paid_amount: newAmount, long_video: false }, `id=eq.${taskId}`); } catch (e) { console.error(e); }
+    refresh();
+  };
+
+  if (!loggedInId) return <LoginScreen monteurs={monteurs} onLogin={id => { setLoggedInId(id); setActivePage("board"); }} />;
+
+  const person = buildPeople(monteurs).find(p => p.id === loggedInId);
+
+  if (loading) {
+    return (
+      <div style={{ background: THEME.bg, color: THEME.text, minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", fontFamily: "'Inter', system-ui, sans-serif" }}>
+        <div style={{ textAlign: "center" }}>
+          <div style={{ fontSize: 14, color: THEME.textDim, marginBottom: 8 }}>Загружаем данные из базы…</div>
+          {loadError && <div style={{ fontSize: 12, color: THEME.coral, maxWidth: 400 }}>Ошибка: {loadError}</div>}
+        </div>
+      </div>
+    );
+  }
+
+  const nav = NAV_BY_ROLE[person.role];
+  const selfMonteur = person.role === "editor" ? monteurs.find(m => m.id === person.monteurId) : null;
+  const boardTasks = person.role === "editor" ? tasks.filter(t => t.monteurId === person.monteurId) : tasks;
+  const selectedCard = tasks.find(t => t.id === selectedCardId) || null;
+
+  const pageTitleMap = { board: person.role === "editor" ? "Моя доска" : "Доска", cabinet: "Личный кабинет", clients: "Клиенты и сложность", monteurs: "Монтажёры и грейды", editorCabinets: "Кабинеты монтажёров", stats: "Статистика" };
+
+  let content = null;
+  if (activePage === "board") {
+    content = person.role === "editor"
+      ? <EditorBoard tasks={boardTasks} onMove={moveOwnStatus} onOpenCard={setSelectedCardId} onReorder={reorderTask} />
+      : <ManagerBoard monteurs={monteurs} tasks={tasks} onMoveCard={moveCard} onOpenCard={setSelectedCardId} onCreateCard={createCard} onReassign={reassignTask} onReorder={reorderTask} clients={clients} />;
+  } else if (activePage === "cabinet" && selfMonteur) {
+    content = <EditorCabinet monteur={selfMonteur} tasks={tasks} revisions={revisions} clients={clients} grades={grades} monteurs={monteurs} longVideoBonus={longVideoBonus} onToggleLongVideo={toggleLongVideo} canEditPayments={false} />;
+  } else if (activePage === "editorCabinets") {
+    content = <MonteurCabinetsPage monteurs={monteurs} tasks={tasks} revisions={revisions} clients={clients} grades={grades} longVideoBonus={longVideoBonus} onToggleLongVideo={toggleLongVideo} onEditPaidAmount={editPaidAmount} />;
+  } else if (activePage === "clients") {
+    content = <ClientsPage clients={clients} setClients={wrapUpdater(clients, persistClients)} onAddClient={addClientRow} />;
+  } else if (activePage === "monteurs") {
+    content = <MonteursPage monteurs={monteurs} setMonteurs={wrapUpdater(monteurs, persistMonteurs)} grades={grades} setGrades={wrapUpdater(grades, persistGrades)} longVideoBonus={longVideoBonus} setLongVideoBonus={persistLongVideoBonus} onAddMonteur={addMonteurRow} />;
+  } else if (activePage === "stats") {
+    content = <TeamStatsPage monteurs={monteurs} tasks={tasks} revisions={revisions} clients={clients} grades={grades} longVideoBonus={longVideoBonus} showMoney={person.role === "owner"} />;
+  }
+
+  return (
+    <div style={{ background: THEME.bg, color: THEME.text, minHeight: "100vh", fontFamily: "'Inter', system-ui, sans-serif", display: "flex" }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Space+Grotesk:wght@600;700&display=swap');
+        * { box-sizing: border-box; }
+        h1,h2,h3 { font-family: 'Space Grotesk', sans-serif; }
+        select, input, button { font-family: inherit; }
+        button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px solid ${THEME.amber}; outline-offset: 1px; }
+        @media (max-width: 720px) {
+          .rs-sidebar { position: fixed; bottom: 0; left: 0; right: 0; top: auto !important; width: 100% !important; height: auto !important;
+            flex-direction: row !important; overflow-x: auto; border-top: 1px solid ${THEME.line}; border-right: none !important; padding: 8px !important; z-index: 40; }
+          .rs-sidebar .rs-nav-item { flex: 1; text-align: center; white-space: nowrap; }
+          .rs-sidebar .rs-brand, .rs-sidebar .rs-logout { display: none; }
+          .rs-content { padding-bottom: 76px !important; }
+        }
+      `}</style>
+
+      <div className="rs-sidebar" style={{ width: 220, borderRight: `1px solid ${THEME.line}`, padding: 16, display: "flex", flexDirection: "column", gap: 4, position: "sticky", top: 0, height: "100vh" }}>
+        <div className="rs-brand" style={{ marginBottom: 18 }}>
+          <div style={{ fontSize: 11, letterSpacing: 1.5, color: THEME.textDim, textTransform: "uppercase" }}>Reels Studio</div>
+          <div style={{ fontWeight: 700, fontSize: 15, marginTop: 4 }}>{person.name}</div>
+          <Pill tone={person.role === "owner" ? "amber" : person.role === "pm" ? "teal" : "dim"}>{person.title}</Pill>
+        </div>
+        {nav.map(n => (
+          <button key={n.key} className="rs-nav-item" onClick={() => setActivePage(n.key)} style={{ textAlign: "left", padding: "9px 12px", borderRadius: 9, border: "none", cursor: "pointer", fontSize: 13, fontWeight: 600, background: activePage === n.key ? "#3A2E17" : "transparent", color: activePage === n.key ? THEME.amber : THEME.textDim }}>
+            {n.label}
+          </button>
+        ))}
+        <div style={{ flex: 1 }} />
+        <button className="rs-logout" onClick={() => setLoggedInId(null)} style={{ ...inputStyle, cursor: "pointer", textAlign: "left" }}>← Выйти</button>
+      </div>
+
+      <div className="rs-content" style={{ flex: 1, padding: "20px 16px 40px", maxWidth: activePage === "board" ? "100%" : 960 }}>
+        <h1 style={{ fontSize: 20, fontWeight: 700, margin: "0 0 16px" }}>{pageTitleMap[activePage]}</h1>
+        {content}
+      </div>
+
+      <CardModal task={selectedCard} monteurs={monteurs} clients={clients} revisions={revisions} person={person} onClose={() => setSelectedCardId(null)} onSendMessage={sendMessage} onReassign={reassignTask} onEditTitle={editCardTitle} onDeleteCard={deleteCard} onDeleteMessage={deleteMessage} />
+    </div>
+  );
+}
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+</script>
+</body>
+</html>
